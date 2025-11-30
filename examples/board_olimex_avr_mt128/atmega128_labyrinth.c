@@ -5,6 +5,9 @@ AVR_MCU(F_CPU, "atmega128");
 
 #define __AVR_ATMEGA128__ 1
 #include <avr/io.h>
+#include <avr/interrupt.h>
+#include <util/delay.h>
+#include <stdio.h>
 
 static void port_init()
 {
@@ -22,24 +25,6 @@ static void port_init()
     DDRF = 0b00000000;
     PORTG = 0b00000000;
     DDRG = 0b00000000;
-}
-
-static void delay_us(unsigned int us)
-{
-    volatile unsigned int i;
-    for (i = 0; i < us; i++)
-    {
-        asm volatile("nop");
-    }
-}
-
-static void delay_ms(unsigned int ms)
-{
-    volatile unsigned int i;
-    for (i = 0; i < ms; i++)
-    {
-        delay_us(1000);
-    }
 }
 
 #define BUTTON_NONE 0
@@ -93,6 +78,14 @@ static void button_unlock()
         button_accept = 1;
     }
 }
+// Blink control
+volatile unsigned char player_visible = 1;
+
+// Timer1 Compare Match A interrupt - fires every 1 second
+ISR(TIMER1_COMPA_vect)
+{
+    player_visible = !player_visible;
+}
 
 #define CLR_DISP 0x00000001
 #define DISP_ON 0x0000000C
@@ -100,13 +93,14 @@ static void button_unlock()
 #define CUR_HOME 0x00000002
 #define DD_RAM_ADDR 0x00000080
 #define DD_RAM_ADDR2 0x000000C0
+#define CG_RAM_ADDR 0x40
 
 static void lcd_pulse()
 {
     PORTC = PORTC | 0b00000100;
-    delay_us(50);
+    _delay_us(50);
     PORTC = PORTC & 0b11111011;
-    delay_us(50);
+    _delay_us(50);
 }
 
 static void lcd_send(int command, unsigned char a)
@@ -128,7 +122,7 @@ static void lcd_send(int command, unsigned char a)
     else
         PORTC = PORTC | 0b00000001;
     lcd_pulse();
-    delay_us(50);
+    _delay_us(50);
 }
 
 static void lcd_send_command(unsigned char a)
@@ -144,19 +138,19 @@ static void lcd_send_data(unsigned char a)
 static void lcd_init()
 {
     PORTC = PORTC & 0b11111110;
-    delay_ms(50); // wait for LCD to power up
+    _delay_ms(50); // wait for LCD to power up
 
     PORTC = 0b00110000; // set D4, D5 port to 1
     lcd_pulse();        // high->low to E port (pulse)
-    delay_ms(5);
+    _delay_ms(5);
 
     PORTC = 0b00110000; // set D4, D5 port to 1
     lcd_pulse();        // high->low to E port (pulse)
-    delay_us(150);
+    _delay_us(150);
 
     PORTC = 0b00110000; // set D4, D5 port to 1
     lcd_pulse();        // high->low to E port (pulse)
-    delay_us(150);
+    _delay_us(150);
 
     PORTC = 0b00100000; // set D4 to 0, D5 port to 1
     lcd_pulse();        // high->low to E port (pulse)
@@ -185,7 +179,7 @@ static void lcd_goto(int row, int col)
 static void lcd_clear()
 {
     lcd_send_command(CLR_DISP);
-    delay_ms(2);
+    _delay_ms(2);
 }
 
 static void lcd_print_char(char c)
@@ -201,181 +195,27 @@ static void lcd_print_string(const char *str)
     }
 }
 
-// CUSTOM CHARACTERS FOR MAZE ELEMENTS
-static void lcd_define_custom_chars()
-{
-    // Character 0: Wall (full block)
-    lcd_send_command(0x40);
-    lcd_send_data(0b11111);
-    lcd_send_data(0b11111);
-    lcd_send_data(0b11111);
-    lcd_send_data(0b11111);
-    lcd_send_data(0b11111);
-    lcd_send_data(0b11111);
-    lcd_send_data(0b11111);
-    lcd_send_data(0b11111);
-
-    // Character 1: Player (circle)
-    lcd_send_command(0x48);
-    lcd_send_data(0b00000);
-    lcd_send_data(0b01110);
-    lcd_send_data(0b10001);
-    lcd_send_data(0b10001);
-    lcd_send_data(0b10001);
-    lcd_send_data(0b01110);
-    lcd_send_data(0b00000);
-    lcd_send_data(0b00000);
-
-    // Character 2: Exit (E with decoration)
-    lcd_send_command(0x50);
-    lcd_send_data(0b11111);
-    lcd_send_data(0b10000);
-    lcd_send_data(0b11110);
-    lcd_send_data(0b10000);
-    lcd_send_data(0b11111);
-    lcd_send_data(0b00000);
-    lcd_send_data(0b11111);
-    lcd_send_data(0b11111);
-
-    // Character 3: Start (S with decoration)
-    lcd_send_command(0x58);
-    lcd_send_data(0b01111);
-    lcd_send_data(0b10000);
-    lcd_send_data(0b01110);
-    lcd_send_data(0b00001);
-    lcd_send_data(0b11110);
-    lcd_send_data(0b00000);
-    lcd_send_data(0b11111);
-    lcd_send_data(0b11111);
-}
-
 // GAME STATE
-#define MAZE_WIDTH 32    // Much larger maze width
-#define MAZE_HEIGHT 8    // Much larger maze height
-#define DISPLAY_WIDTH 16 // LCD display width
-#define DISPLAY_HEIGHT 2 // LCD display height
-#define WALL_CHAR 0
-#define EMPTY_CHAR ' '
-#define PLAYER_CHAR 1
-#define EXIT_CHAR 2
-#define START_CHAR 3
+#define MAZE_WIDTH 40     // Full maze width
+#define MAZE_HEIGHT 32    // Full maze height
+#define DISPLAY_WIDTH 20  // Visible area width
+#define DISPLAY_HEIGHT 16 // Visible area height
 #define MAX_LEVELS 5
+#define WALL 1
+#define PATH 0
 
-static char maze[MAZE_HEIGHT][MAZE_WIDTH];
+static unsigned char maze[MAZE_HEIGHT][MAZE_WIDTH];
 static int player_x, player_y;
 static int exit_x, exit_y;
+static int start_x, start_y;
 static int viewport_x, viewport_y;
 static int game_won = 0;
 static int level = 1;
 static int total_steps = 0;
+static int level_steps = 0;
 
-static void copy_maze(char maze_array[MAZE_HEIGHT][MAZE_WIDTH])
+static void center_viewport_on_player()
 {
-    for (int i = 0; i < MAZE_HEIGHT; i++)
-    {
-        for (int j = 0; j < MAZE_WIDTH; j++)
-        {
-            if (maze_array[i][j] == '#')
-                maze[i][j] = WALL_CHAR;
-            else if (maze_array[i][j] == 'S')
-            {
-                maze[i][j] = START_CHAR;
-                player_x = j;
-                player_y = i;
-            }
-            else if (maze_array[i][j] == 'E')
-            {
-                maze[i][j] = EXIT_CHAR;
-                exit_x = j;
-                exit_y = i;
-            }
-            else
-                maze[i][j] = EMPTY_CHAR;
-        }
-    }
-}
-
-static void generate_maze()
-{
-    switch (level)
-    {
-    case 1:
-    {
-        char level1[MAZE_HEIGHT][MAZE_WIDTH] = {
-            "################################",
-            "# #     #       #     #       E#",
-            "#   ### # ##### # ### # ##### ##",
-            "### #   # #   # # # # #     # ##",
-            "# # # ### # # # # # # ##### # ##",
-            "#         # #     #         # ##",
-            "#S####### # ############### # ##",
-            "################################"};
-        copy_maze(level1);
-        break;
-    }
-    case 2:
-    {
-        char level2[MAZE_HEIGHT][MAZE_WIDTH] = {
-            "################################",
-            "##  #     #   #   #   #    #####",
-            "### # ### # # # # # # # ## ## ##",
-            "#     # # # #     # #   #   # ##",
-            "# ##### # # ## ## ### # # # # ##",
-            "# #   # #       #   # #   #   ##",
-            "#S# # # ### # # ###   ##### #E##",
-            "################################"};
-
-        copy_maze(level2);
-        break;
-    }
-    case 3:
-    {
-        char level3[MAZE_HEIGHT][MAZE_WIDTH] = {
-            "#S##############################",
-            "# #    #    ## # #   #    ##  ##",
-            "# # # # # # # # # # # # # ## ###",
-            "#   # # # # #     # # # # #   ##",
-            "#####   # # # # # #   # #   # ##",
-            "#   # # # #   # # # #   ### # ##",
-            "# # # #   ### # #   ### #   # ##",
-            "#########################E######"};
-
-        copy_maze(level3);
-        break;
-    }
-    case 4:
-    {
-        char level4[MAZE_HEIGHT][MAZE_WIDTH] = {
-            "###S#####################   ####",
-            "### #   # #   # #   #   # #  #E#",
-            "# # # # # # # # # # # # # # #  #",
-            "#     # #   #   # # # # #   # ##",
-            "# ### # ### ### # ### # # ### ##",
-            "# ###   # #   # # #   # # #   ##",
-            "# # ## ###  # #   # ###     # ##",
-            "######     ######   ############"};
-
-        copy_maze(level4);
-        break;
-    }
-    case 5:
-    {
-        char level5[MAZE_HEIGHT][MAZE_WIDTH] = {
-            "###    #########################",
-            "#   ##        #   #       #   ##",
-            "# ####### # ### # ### ### # # ##",
-            "  #     # #     #     #     # ##",
-            " ## ### # ####### # # ##### # ##",
-            "  # #   ###     # # # #   # # ##",
-            "# # # #     # ####E###  #   # ##",
-            "#   ####  ##   S##     ########"};
-
-        copy_maze(level5);
-        break;
-    }
-    }
-
-    // Initialize viewport to center around player
     viewport_x = player_x - DISPLAY_WIDTH / 2;
     viewport_y = player_y - DISPLAY_HEIGHT / 2;
 
@@ -389,64 +229,184 @@ static void generate_maze()
         viewport_y = MAZE_HEIGHT - DISPLAY_HEIGHT;
 }
 
-static void update_viewport(int dx, int dy)
+static void generate_maze()
 {
-    if (dy < 0)
+
+    switch (level)
     {
-        viewport_y = player_y - 1;
-    }
-    else if (dy > 0)
+    case 1:
+    case 2:
+    case 3:
+    case 4:
+    case 5:
     {
-        viewport_y = player_y;
-    }
-
-    viewport_x = player_x - DISPLAY_WIDTH / 2;
-
-    if (viewport_x < 0)
-        viewport_x = 0;
-    if (viewport_x > MAZE_WIDTH - DISPLAY_WIDTH)
-        viewport_x = MAZE_WIDTH - DISPLAY_WIDTH;
-    if (viewport_y < 0)
-        viewport_y = 0;
-    if (viewport_y > MAZE_HEIGHT - DISPLAY_HEIGHT)
-        viewport_y = MAZE_HEIGHT - DISPLAY_HEIGHT;
-
-    // Check if reached exit
-    if (player_x == exit_x && player_y == exit_y)
-    {
-        game_won = 1;
-    }
-}
-
-static void draw_maze()
-{
-    int display_row, display_col;
-
-    for (display_row = 0; display_row < DISPLAY_HEIGHT; display_row++)
-    {
-        lcd_goto(display_row, 0);
-        for (display_col = 0; display_col < DISPLAY_WIDTH; display_col++)
+        // Reuse level 1 for now - you can expand these later
+        for (int i = 0; i < MAZE_HEIGHT; i++)
         {
-            int maze_x = viewport_x + display_col;
-            int maze_y = viewport_y + display_row;
-
-            if (maze_x >= 0 && maze_x < MAZE_WIDTH && maze_y >= 0 && maze_y < MAZE_HEIGHT)
+            for (int j = 0; j < MAZE_WIDTH; j++)
             {
-                if (maze_x == player_x && maze_y == player_y)
+                if (i == 0 || i == MAZE_HEIGHT - 1 || j == 0 || j == MAZE_WIDTH - 1)
                 {
-                    lcd_print_char(PLAYER_CHAR);
+                    maze[i][j] = WALL;
+                }
+                else if (i % 4 == 0 && j % 6 != 1)
+                {
+                    maze[i][j] = WALL;
+                }
+                else if (j % 8 == 0 && i % 3 != 1)
+                {
+                    maze[i][j] = WALL;
                 }
                 else
                 {
-                    lcd_print_char(maze[maze_y][maze_x]);
+                    maze[i][j] = PATH;
                 }
             }
-            else
+        }
+
+        start_x = 0;
+        start_y = 1;
+        player_x = start_x;
+        player_y = start_y;
+        exit_x = MAZE_WIDTH - 1;
+        exit_y = MAZE_HEIGHT - 2;
+
+        maze[start_y][start_x] = 0;
+        maze[exit_y][exit_x] = 0;
+        break;
+    }
+    }
+
+    center_viewport_on_player();
+    level_steps = 0;
+}
+
+static unsigned char get_pixel(int px, int py)
+{
+    if (px == player_x && py == player_y)
+    {
+        return player_visible ? WALL : PATH;
+    }
+
+    return maze[py][px];
+}
+
+// Helper: Build character data for a 5x8 pixel block
+static void build_char_data(unsigned char *char_data, int pixel_x_start, int pixel_y_start)
+{
+    for (int row = 0; row < 8; row++)
+    {
+        unsigned char line = 0;
+        for (int col = 0; col < 5; col++)
+        {
+            int px = viewport_x + pixel_x_start + col;
+            int py = viewport_y + pixel_y_start + row;
+
+            if (get_pixel(px, py))
             {
-                lcd_print_char(WALL_CHAR);
+                line |= (1 << (4 - col));
             }
         }
+        char_data[row] = line;
     }
+}
+
+// Helper: Define a custom character in CGRAM
+static void define_custom_char(int char_index, unsigned char *char_data)
+{
+    lcd_send_command(CG_RAM_ADDR + (char_index * 8));
+    for (int i = 0; i < 8; i++)
+    {
+        lcd_send_data(char_data[i]);
+    }
+}
+
+// Helper: Display a character at a specific position
+static void display_char_at(int char_row, int char_col, int char_index)
+{
+    if (char_row == 0)
+    {
+        lcd_send_command(DD_RAM_ADDR + char_col);
+    }
+    else
+    {
+        lcd_send_command(DD_RAM_ADDR2 + char_col);
+    }
+    lcd_send_data(char_index);
+}
+
+// Main draw function
+static void draw_maze()
+{
+    int char_index = 0;
+
+    // Define all 8 custom characters
+    for (int char_row = 0; char_row < 2; char_row++)
+    {
+        for (int char_col = 0; char_col < 4; char_col++)
+        {
+            unsigned char char_data[8];
+            int pixel_x_start = char_col * 5;
+            int pixel_y_start = char_row * 8;
+
+            build_char_data(char_data, pixel_x_start, pixel_y_start);
+            define_custom_char(char_index, char_data);
+            char_index++;
+        }
+    }
+
+    // Display all characters
+    char_index = 0;
+    for (int char_row = 0; char_row < 2; char_row++)
+    {
+        for (int char_col = 0; char_col < 4; char_col++)
+        {
+            display_char_at(char_row, char_col, char_index);
+            char_index++;
+        }
+    }
+}
+
+// Redraw only the character containing the player
+static void draw_player_char()
+{
+    // Calculate which character (0-7) contains the player
+    int player_screen_x = player_x - viewport_x;
+    int player_screen_y = player_y - viewport_y;
+
+    int char_col = player_screen_x / 5; // Each char is 5 pixels wide
+    int char_row = player_screen_y / 8; // Each char is 8 pixels tall
+
+    // Make sure player is within visible area
+    if (char_col < 0 || char_col >= 4 || char_row < 0 || char_row >= 2)
+        return;
+
+    int char_index = char_row * 4 + char_col; // calculates CGRAM slot
+    int pixel_x_start = char_col * 5;         // starting pixel x within viewport
+    int pixel_y_start = char_row * 8;         // starting pixel y within viewport
+
+    unsigned char char_data[8];
+    build_char_data(char_data, pixel_x_start, pixel_y_start); // Rebuild character data
+    define_custom_char(char_index, char_data);                // Redefine character in CGRAM
+    display_char_at(char_row, char_col, char_index);          // Redisplay character on screen
+}
+
+static void draw_stats()
+{
+    lcd_goto(0, 5);
+    lcd_print_string("Lv:");
+    lcd_print_char(level + '0');
+
+    lcd_goto(0, 9);
+    lcd_print_string(" S:");
+    char steps_str[5];
+    snprintf(steps_str, sizeof(steps_str), "%d", level_steps);
+    lcd_print_string(steps_str);
+
+    lcd_goto(1, 5);
+    lcd_print_string("Total:");
+    snprintf(steps_str, sizeof(steps_str), "%d", total_steps);
+    lcd_print_string(steps_str);
 }
 
 static int can_move(int new_x, int new_y)
@@ -456,7 +416,7 @@ static int can_move(int new_x, int new_y)
         return 0;
     }
 
-    if (maze[new_y][new_x] == WALL_CHAR)
+    if (maze[new_y][new_x] == WALL)
     {
         return 0;
     }
@@ -474,7 +434,15 @@ static void move_player(int dx, int dy)
         player_x = new_x;
         player_y = new_y;
         total_steps++;
-        update_viewport(dx, dy);
+        level_steps++;
+
+        center_viewport_on_player();
+
+        // Check if reached exit
+        if (player_x == exit_x && player_y == exit_y)
+        {
+            game_won = 1;
+        }
     }
 }
 static void show_win_screen()
@@ -482,7 +450,7 @@ static void show_win_screen()
     lcd_clear();
     lcd_goto(0, 0);
     lcd_print_string(" Level ");
-    lcd_print_char(level + 48);
+    lcd_print_char(level + '0');
     lcd_print_string(" Clear!");
     lcd_goto(1, 0);
     lcd_print_string("Press middle btn");
@@ -490,58 +458,13 @@ static void show_win_screen()
     while (button_pressed() == BUTTON_CENTER)
     {
         button_unlock();
-        delay_ms(10);
+        _delay_ms(10);
     }
 
     while (button_pressed() != BUTTON_CENTER)
     {
         button_unlock();
-        delay_ms(10);
-    }
-}
-
-void show_stats_screen()
-{
-    lcd_clear();
-    lcd_goto(0, 0);
-    lcd_print_string(" Steps: ");
-
-    // Convert total_steps to string and display
-    char steps_str[10];
-    int i = 0;
-    int s = total_steps;
-
-    if (s == 0)
-    {
-        steps_str[i++] = '0';
-    }
-    else
-    {
-        char temp[10];
-        int j = 0;
-        while (s > 0)
-        {
-            temp[j++] = (s % 10) + '0';
-            s /= 10;
-        }
-        while (j > 0)
-        {
-            steps_str[i++] = temp[--j];
-        }
-    }
-    steps_str[i] = '\0';
-    lcd_print_string(steps_str);
-
-    while (button_pressed() == BUTTON_CENTER)
-    {
-        button_unlock();
-        delay_ms(10);
-    }
-
-    while (button_pressed() != BUTTON_CENTER)
-    {
-        button_unlock();
-        delay_ms(10);
+        _delay_ms(10);
     }
 }
 
@@ -556,13 +479,13 @@ static void show_start_screen()
     while (button_pressed() == BUTTON_CENTER)
     {
         button_unlock();
-        delay_ms(10);
+        _delay_ms(10);
     }
 
     while (button_pressed() != BUTTON_CENTER)
     {
         button_unlock();
-        delay_ms(10);
+        _delay_ms(10);
     }
 }
 
@@ -577,13 +500,13 @@ static void show_finish_screen()
     while (button_pressed() == BUTTON_CENTER)
     {
         button_unlock();
-        delay_ms(10);
+        _delay_ms(10);
     }
 
     while (button_pressed() != BUTTON_CENTER)
     {
         button_unlock();
-        delay_ms(10);
+        _delay_ms(10);
     }
 }
 
@@ -591,8 +514,10 @@ int main()
 {
     port_init();
     lcd_init();
-    lcd_define_custom_chars();
 
+    TCCR1B = (4 << CS10); // 256 prescaler
+    TIMSK |= (1 << OCIE1A);
+    sei();
     show_start_screen();
 
     while (1)
@@ -602,11 +527,20 @@ int main()
         lcd_clear();
 
         int need_redraw = 1;
+        unsigned char last_player_state = player_visible;
         while (!game_won)
         {
+            // Redraw only player character if blink state changed
+            if (last_player_state != player_visible)
+            {
+                draw_player_char();
+                last_player_state = player_visible;
+            }
+
             if (need_redraw)
             {
                 draw_maze();
+                draw_stats();
                 need_redraw = 0;
             }
 
@@ -648,7 +582,6 @@ int main()
         if (level > MAX_LEVELS)
         {
             show_finish_screen();
-            show_stats_screen();
 
             game_won = 0;
             level = 1;
